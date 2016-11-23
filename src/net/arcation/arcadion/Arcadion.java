@@ -3,8 +3,12 @@ package net.arcation.arcadion;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import com.zaxxer.hikari.pool.HikariPool;
+import net.arcation.arcadion.interfaces.BatchLayout;
+import net.arcation.arcadion.interfaces.InsertBatcher;
 import net.arcation.arcadion.interfaces.Insertable;
 import net.arcation.arcadion.interfaces.Selectable;
+import net.arcation.arcadion.util.Action;
+import net.arcation.arcadion.util.Provider;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -12,9 +16,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedTransferQueue;
 
 /**
  * Created by Mr_Little_Kitty on 11/7/2016.
@@ -23,11 +25,11 @@ public class Arcadion extends JavaPlugin implements net.arcation.arcadion.interf
 {
     public static net.arcation.arcadion.interfaces.Arcadion instance;
 
-    private List<DisableableThread> threads;
+    private ThreadGroup threads;
     private HikariDataSource dataSource;
 
-    private ConcurrentLinkedQueue<Insertable> asyncInsertables;
-    private ConcurrentLinkedQueue<Selectable> asyncSelectables;
+    private LinkedTransferQueue<Action> asyncInsertables;
+    private LinkedTransferQueue<Selectable> asyncSelectables;
 
     private static String HOST_PATH = "database.host";
     private static String PORT_PATH = "database.port";
@@ -36,8 +38,12 @@ public class Arcadion extends JavaPlugin implements net.arcation.arcadion.interf
     private static String PASSWORD_PATH = "database.password";
 
     private static String MAX_CONNECTIONS_PATH = "settings.maxConnections";
-    private static String SELECT_THREADS = "settings.selectThreads";
-    private static String INSERT_THREADS = "settings.insertThreads";
+    private static String SELECT_THREADS_PATH = "settings.selectThreads";
+    private static String INSERT_THREADS_PATH = "settings.insertThreads";
+
+    private static String CONNECTION_TIMEOUT_PATH = "settings.connectionTimeout";
+    private static String IDLE_TIMEOUT_PATH = "settings.connectionIdleTimeout";
+    private static String MAX_LIFETIME = "settings.connectionMaxLifetime";
 
     @Override
     public void onEnable()
@@ -55,14 +61,32 @@ public class Arcadion extends JavaPlugin implements net.arcation.arcadion.interf
 
         int maxConnections = pluginConfig.getInt(MAX_CONNECTIONS_PATH);
 
+        long connectTimeout = pluginConfig.getLong(CONNECTION_TIMEOUT_PATH);
+        long idleTimeout = pluginConfig.getLong(IDLE_TIMEOUT_PATH);
+        long maxLifetime = pluginConfig.getLong(MAX_LIFETIME);
+
         HikariConfig config = new HikariConfig();
         config.setJdbcUrl("jdbc:mysql://" + hostname + ":" + port + "/" + databaseName);
         config.setUsername(user);
         config.setPassword(pass);
+
+        //The maximum amount of connections in the connection pool
         config.setMaximumPoolSize(maxConnections);
 
-        asyncInsertables = new ConcurrentLinkedQueue<>();
-        asyncSelectables = new ConcurrentLinkedQueue<>();
+        //The maximum amount of time a connection will wait for a SQL command to be executed before...it fails? I guess?
+        config.setConnectionTimeout(connectTimeout);
+
+        //The maximum amount of time a connection is allowed to set idle before it is retired
+        config.setIdleTimeout(idleTimeout);
+
+        //The maximum amount of time a connection is allowed to stay in the pool
+        config.setMaxLifetime(maxLifetime);
+
+        //The name of the pool used in logging and stuff
+        config.setPoolName("Arcadion Connection Pool");
+
+        asyncInsertables = new LinkedTransferQueue<>();
+        asyncSelectables = new LinkedTransferQueue<>();
 
         try
         {
@@ -76,36 +100,68 @@ public class Arcadion extends JavaPlugin implements net.arcation.arcadion.interf
 
         if(isActive())
         {
-            this.getLogger().info("[Arcadion] Successfully connected to the database server!");
-            threads = new ArrayList<>();
+            this.getLogger().info("Successfully connected to the database server!");
+            threads = new ThreadGroup("Arcadion Thread Group");
 
-            int insertThreads = pluginConfig.getInt(INSERT_THREADS);
-            int selectThreads = pluginConfig.getInt(SELECT_THREADS);
+            int insertThreads = pluginConfig.getInt(INSERT_THREADS_PATH);
+            int selectThreads = pluginConfig.getInt(SELECT_THREADS_PATH);
+
+            if(selectThreads <= 0)
+                selectThreads = 1;
+            if(insertThreads <= 0)
+                insertThreads = 1;
 
             for(int i = 0; i < selectThreads; i++)
             {
-                SelectThread t = new SelectThread(this);
-                threads.add(t);
+                SelectThread t = new SelectThread(this,threads);
                 t.start();
-                this.getLogger().info("[Arcadion] Created Select Thread #" + (i + 1));
+                this.getLogger().info("Created Select Thread #" + (i + 1));
             }
             for(int i = 0; i < insertThreads; i++)
             {
-                InsertThread t = new InsertThread(this);
-                threads.add(t);
+                InsertThread t = new InsertThread(this,threads);
                 t.start();
-                this.getLogger().info("[Arcadion] Created Insert Thread #" + (i + 1));
+                this.getLogger().info("Created Insert Thread #" + (i + 1));
             }
         }
         else
-            this.getLogger().info("[Arcadion] ERROR Could not connect to the database server!");
+            this.getLogger().info("ERROR Could not connect to the database server!");
     }
 
     @Override
     public void onDisable()
     {
-        if(dataSource != null && !dataSource.isClosed())
-            dataSource.close();
+        //Interrupt all the threads first
+        threads.interrupt();
+
+        //Get all the threads to enumerate over them
+        Thread[] finalThreads = new Thread[threads.activeCount()];
+        threads.enumerate(finalThreads);
+
+        this.getLogger().info("Waiting on end of "+finalThreads.length+" threads.");
+
+        //For loop because its simpler and depends less on Iterators, etc...
+        for(int i = 0; i < finalThreads.length; i++)
+        {
+            try
+            {
+                //Join on all the interrupted threads to make sure they all finish (6 second timeout)
+                if(finalThreads[i] != null)
+                    finalThreads[i].join(6000);
+            }
+            catch (InterruptedException e)
+            {
+                this.getLogger().info("ERROR A database thread had an error while shutting down: "+e.getMessage());
+            }
+
+            if(finalThreads[i].isAlive())
+                this.getLogger().info("ERROR A database thread did not shut down in time: ThreadName: "+finalThreads[i].getName());
+        }
+
+        this.getLogger().info("Successfully ended "+finalThreads.length+" threads.");
+
+        //Close the actual threadpool with all its database connections
+        dataSource.close();
     }
 
     private void addDefaults()
@@ -113,14 +169,18 @@ public class Arcadion extends JavaPlugin implements net.arcation.arcadion.interf
         FileConfiguration config = getConfig();
 
         config.addDefault(HOST_PATH,"127.0.0.1");
-        config.addDefault(PORT_PATH,3380);
+        config.addDefault(PORT_PATH, 3380);
         config.addDefault(DATABASE_PATH,"civex");
         config.addDefault(USERNAME_PATH,"root");
         config.addDefault(PASSWORD_PATH,"pass");
 
         config.addDefault(MAX_CONNECTIONS_PATH, 6);
-        config.addDefault(SELECT_THREADS, 1);
-        config.addDefault(INSERT_THREADS, 1);
+        config.addDefault(SELECT_THREADS_PATH, 1);
+        config.addDefault(INSERT_THREADS_PATH, 1);
+
+        config.addDefault(CONNECTION_TIMEOUT_PATH, (long)(8 * 1000)); //8 seconds (8 times 1000 milliseconds)
+        config.addDefault(IDLE_TIMEOUT_PATH, (long)(10 * 60 * 1000)); //10 minutes (10 times 60 seconds times 1000 milliseconds)
+        config.addDefault(MAX_LIFETIME,(long)(2 * 60 * 60 * 1000)); //2 hours (2 times 60 minutes * 60 seconds * 1000 milliseconds)
 
         config.options().copyDefaults(true);
 
@@ -134,35 +194,43 @@ public class Arcadion extends JavaPlugin implements net.arcation.arcadion.interf
 
     public void queueAsyncInsertable(Insertable insertable)
     {
-        asyncInsertables.add(insertable);
+        if(insertable != null)
+            asyncInsertables.offer(new InsertWrapper(insertable));
+    }
+
+    //Package private method to allow things like the batcher to insert stuff async using non-standard code
+    void queueAsyncInsertable(Action provider)
+    {
+        if(provider != null)
+            asyncInsertables.offer(provider);
     }
 
     public boolean insert(Insertable insertable)
     {
-        try(Connection connection = dataSource.getConnection())
+        try (Connection connection = dataSource.getConnection())
         {
-            try(PreparedStatement statement = connection.prepareStatement(insertable.getStatement()))
+            try (PreparedStatement statement = connection.prepareStatement(insertable.getStatement()))
             {
                 insertable.setParameters(statement);
                 try
                 {
                     statement.execute();
                 }
-                catch(SQLException ex)
+                catch (SQLException ex)
                 {
-                    getLogger().info("[Arcadion] ERROR Executing statement: "+ex.getMessage());
+                    getLogger().info("ERROR Executing statement: " + ex.getMessage());
                     return false;
                 }
             }
-            catch(SQLException ex)
+            catch (SQLException ex)
             {
-                getLogger().info("[Arcadion] ERROR Preparing statement: "+ex.getMessage());
+                getLogger().info("ERROR Preparing statement: " + ex.getMessage());
                 return false;
             } //Try with resources closes the statement when its over
         } //Try with resources closes the connection when its over
-        catch(SQLException ex)
+        catch (SQLException ex)
         {
-            getLogger().info("[Arcadion] ERROR Acquiring connection: "+ex.getMessage());
+            getLogger().info("ERROR Acquiring connection: " + ex.getMessage());
             return false;
         }
         return true;
@@ -170,53 +238,54 @@ public class Arcadion extends JavaPlugin implements net.arcation.arcadion.interf
 
     public void queueAsyncSelectable(Selectable selectable)
     {
-        asyncSelectables.add(selectable);
+        if(selectable != null)
+            asyncSelectables.offer(selectable);
     }
 
     public boolean select(Selectable selectable)
     {
-        try(Connection connection = dataSource.getConnection())
+        try (Connection connection = dataSource.getConnection())
         {
-            try(PreparedStatement statement = connection.prepareStatement(selectable.getQuery()))
+            try (PreparedStatement statement = connection.prepareStatement(selectable.getQuery()))
             {
                 selectable.setParameters(statement);
                 try
                 {
-                    ResultSet set = statement.executeQuery();
-
-                    selectable.receiveResult(set);
-                    set.close();
+                    try( ResultSet set = statement.executeQuery())
+                    {
+                       selectable.receiveResult(set);
+                    } //Try with resources closes the result set when its done
 
                     selectable.callBack();
                 }
-                catch(SQLException ex)
+                catch (SQLException ex)
                 {
-                    getLogger().info("[Arcadion] ERROR Executing query statement: "+ex.getMessage());
+                    getLogger().info("ERROR Executing query statement: " + ex.getMessage());
                     return false;
                 }
             }
-            catch(SQLException ex)
+            catch (SQLException ex)
             {
-                getLogger().info("[Arcadion] ERROR Preparing query statement: "+ex.getMessage());
+                getLogger().info("ERROR Preparing query statement: " + ex.getMessage());
                 return false;
             } //Try with resources closes the statement when its over
         } //Try with resources closes the connection when its over
-        catch(SQLException ex)
+        catch (SQLException ex)
         {
-            getLogger().info("[Arcadion] ERROR Acquiring query connection: "+ex.getMessage());
+            getLogger().info("ERROR Acquiring query connection: " + ex.getMessage());
             return false;
         }
         return true;
     }
 
-    Insertable nextInsertableInQueue()
+    LinkedTransferQueue<Action> getInsertableQueue()
     {
-        return asyncInsertables.poll();
+        return asyncInsertables;
     }
 
-    Selectable nextSelectableInQueue()
+    LinkedTransferQueue<Selectable> getSelectableQueue()
     {
-        return asyncSelectables.poll();
+        return asyncSelectables;
     }
 
     HikariDataSource getDataSource()
@@ -224,10 +293,88 @@ public class Arcadion extends JavaPlugin implements net.arcation.arcadion.interf
         return dataSource;
     }
 
+    public boolean executeCommand(String command)
+    {
+        try (Connection connection = dataSource.getConnection())
+        {
+            try (PreparedStatement statement = connection.prepareStatement(command))
+            {
+                return statement.execute();
+            }
+            catch (SQLException ex)
+            {
+                getLogger().info("ERROR Preparing command statement: " + ex.getMessage());
+                return false;
+            }
+        }
+        catch (SQLException ex)
+        {
+            getLogger().info("ERROR Acquiring command connection: " + ex.getMessage());
+            return false;
+        }
+    }
+
     public Connection getConnection() throws SQLException
     {
         if(!isActive())
             return null;
         return dataSource.getConnection();
+    }
+
+    public <T> InsertBatcher<T> prepareInsertBatcher(BatchLayout<T> layout)
+    {
+        InsertBatcher<T> toReturn;
+        try
+        {
+            toReturn = new Batcher<>(this,layout);
+        }
+        catch (SQLException e)
+        {
+            getLogger().info("ERROR in instantiating batcher: " + e.getMessage());
+            toReturn = null;
+        }
+        return toReturn;
+    }
+
+    private class InsertWrapper implements Action
+    {
+        private final Insertable insertable;
+
+        public InsertWrapper(Insertable insertable)
+        {
+            this.insertable = insertable;
+            assert insertable != null;
+        }
+
+        @Override
+        public void act()
+        {
+            try (Connection connection = getDataSource().getConnection())
+            {
+                try (PreparedStatement statement = connection.prepareStatement(insertable.getStatement()))
+                {
+                    insertable.setParameters(statement);
+                    try
+                    {
+                        statement.execute();
+                    }
+                    catch (SQLException ex)
+                    {
+                        getLogger().info("ERROR Executing statement: " + ex.getMessage());
+                        return;
+                    }
+                }
+                catch (SQLException ex)
+                {
+                    getLogger().info("ERROR Preparing statement: " + ex.getMessage());
+                    return;
+                } //Try with resources closes the statement when its over
+            } //Try with resources closes the connection when its over
+            catch (SQLException ex)
+            {
+                getLogger().info("ERROR Acquiring connection: " + ex.getMessage());
+                return;
+            }
+        }
     }
 }
